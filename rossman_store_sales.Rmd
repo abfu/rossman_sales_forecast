@@ -1,0 +1,334 @@
+---
+title: "Rossman Store Sales"
+runtime: shiny
+output: 
+  html_document:
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, global, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Loading Dependencies
+library(shiny)
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(plotly)
+library(lubridate)
+library(tseries)
+library(forecast)
+library(purrr)
+library(MLmetrics)
+library(zoo)
+library(prophet)
+```
+
+## Contents
+
+- Intro
+- EDA / Cleaning
+* Test for stationarity
+- Preprocess
+- ARIMA as baseline
+
+------------------
+
+Intro
+
+Dataset : [https://www.kaggle.com/c/rossmann-store-sales/data]
+
+Sales is target variable
+
+
+
+Graphs:
+
+sales by month over all stores
+
+correlation of sales and features - heatmap
+
+
+Plan:
+
+Use Jan to April 2015 as validation set
+
+Customers not included in test set
+
+Create model for each store / storetype
+
+Create model for all stores
+
+```{r}
+# Reading csv files
+stores <- read.csv('store.csv')
+train <- read.csv('train.csv')
+test <- read.csv('test.csv')
+
+train$Date <- as.Date(train$Date, '%Y-%m-%d')
+test$Date <- as.Date(test$Date, '%Y-%m-%d')
+train <- train[order(train$Date),]
+test <- test[order(test$Date),]
+train_open <- train %>% filter(Open == 1)
+```
+
+**Data Fields**
+
+* `id` - an Id that represents a (store, Date) duple within the test set
+* `Store` - a unique Id for each store
+## Cleaning the data
+
+Missing values in test, train and store set.
+
+Differing columns of train and test set.
+
+Need to give same information.
+* could start with using only features available to both sets.
+* add features to train set
+* engineer features in test set
+
+```{r}
+#Handling missing values
+sum(is.na(train))
+sum(is.na(test))
+sum(is.na(stores))
+map(stores, ~sum(is.na(.)))
+
+which(is.na(stores$CompetitionDistance))
+stores$CompetitionDistance[which(is.na(stores$CompetitionDistance))] <-  max(stores$CompetitionDistance, na.rm=TRUE)
+
+#Remove rows where stores were closed
+
+
+```
+# EDA
+Challanges with the data:
+
+Customers:
+* Likely highly correlated to sales
+* feature not present in test set
+* can combine feature to sales per customer, but might be wrong metric.
+* can remove feature, to reduce overfitting
+
+Day of Week:
+* Day of week does not carry additional information, as it is dependant on the Date
+* 
+
+Competition:
+For some competing stores, no opening date is given.
+Only in Competition distance 3 missing values.
+* Can't set to 0 as that would mean zero distance to competition
+* Could create category of distance
+
+- can bin competitiondistance
+- Assuming missing values in competition distance is for no nearby competition. Setting to max distance.
+
+Promotion:
+- Ideas:
+
+* Encoding of PromoInterval, so no need for feature `promo2`, `promo2sinceweek` and `promo2sinceyear`
+-> Create feature that is `1` if promo2 is active and `0` if promo2 is inactive.
+-> Keep track of stores participating in promo2 
+
+Conclusion:
+
+* Start with basic model and see how far we can get.
+* Can add following store information to data set
+
+
+```{r}
+#Plot sales per month over all stores
+subset <- train %>% mutate(Date = floor_date(Date, unit='month'))
+plot_ly(subset %>% group_by(Date) %>% summarise(mean(Sales)),
+        x = ~Date, y = ~`mean(Sales)`, type='scatter', mode='lines', width=800,
+        height=400) %>% layout(xaxis = list(title='Date'), yaxis = list(title='Average Sales'))
+
+```
+
+
+```{r}
+#Plot sales per month by store
+selectInput("selected", label = "Select Store ID",
+                   choices = stores$Store)
+
+renderPlotly({
+  plot_ly(subset %>% group_by(Store, Date) %>% filter(Store == input$selected & Sales > 0)
+          %>% summarise(mean(Sales)), x = ~Date, y = ~`mean(Sales)`,
+          type='scatter', mode='lines', width=800, height=400) %>% 
+    layout(xaxis = list(title='Date'), yaxis = list(title='Average Sales'))
+  
+})
+```
+
+```{r}
+#Plot autocorrelation and autoplot
+avg_sales <- train_open %>% group_by(Date) %>% summarise(mean(Sales))
+
+Acf(ts(avg_sales[2]))
+autoplot(ts(avg_sales[2]))
+
+```
+
+```{r}
+#Add store data to train set
+train$StoreType <- NA
+train$Assortment <- NA
+train$Promo2 <- NA
+
+for (i in stores$Store){
+  train$StoreType[c(which(train$Store == stores$Store[i]))] <- stores$StoreType[which(stores$Store == i)]
+  train$Assortment[c(which(train$Store == stores$Store[i]))] <- stores$Assortment[which(stores$Store == i)]
+  train$Promo2[c(which(train$Store == stores$Store[i]))] <- stores$Promo2[which(stores$Store == i)]
+}
+
+train$StoreType <-as.factor(train$StoreType)
+train$Assortment <- as.factor(train$Assortment)
+
+levels(train$StoreType) <- c('a', 'b', 'c', 'd')
+levels(train$Assortment) <- c('a', 'b', 'c')
+
+
+#Remove customer feature
+train <- subset(train, select = -c(Customers))
+```
+
+```{r}
+#Sort train set
+
+#Split train set into train and validation set
+#Set size of validation set to size of test set (Number of unique days)
+
+length(unique(test$Date))
+
+datesplit <- unique(train$Date)[length(unique(train$Date)) - length(unique(test$Date))]
+
+val <- train[c(which(train$Date >= as.Date(datesplit))),]
+train_sub <- train[-c(which(train$Date >= as.Date(datesplit))),]
+
+datesplit_open <- unique(train_open$Date)[length(unique(train_open$Date)) - length(unique(test$Date))]
+
+val_open <- train_open[c(which(train_open$Date >= as.Date(datesplit))),]
+train_sub_open <- train_open[-c(which(train_open$Date >= as.Date(datesplit_open))),]
+
+#Reduce test set by removing Promo2 and competition dates, so train/validation set match the test set
+
+#add seasonal term
+
+```
+
+Arima
+
+```{r}
+#Function calculates RMSPE for days with sales larger than 0
+rmspe_ignore <- function(true_ts, predicted_ts) {
+  index <- list()
+  pred_df <- data.frame(ncol(2))
+  for (i in c(length(true_ts):1)){
+    if (true_ts[i] == 0){
+      index <- c(index, i)
+      true_ts <- true_ts[-i]
+      predicted_ts <- predicted_ts[-i]
+    }
+  }
+  print(RMSPE(true_ts, predicted_ts))
+}
+
+
+```
+
+
+```{r}
+val$prediction <- NA
+
+
+# Function takes list of sales, ordered by date and store id as input
+arima_model <- function(sales, store_id){
+  sales <- ts(sales, frequency = 365)
+  model <- auto.arima(sales, D=1, lambda=BoxCox.lambda(sales))
+  prediction <- forecast(model, h=length(which(val$Store == as.integer(store_id))), lambda=model$lambda)$mean
+  return(prediction)
+  rm(model)
+  rm(prediction)
+}
+
+#Arima model
+#sales_ts <- ts(train$Sales)
+#model <- auto.arima(sales_ts, parallel=TRUE, stepwise=FALSE, num.cores = 4)
+#summary(model)
+
+#Get number of data points to predict
+#prediction <- forecast(model, h=count(val))$mean
+
+# Eval
+#RMSPE(ts(val$Sales), prediction)
+
+```
+
+Arima for each store
+
+```{r}
+
+for (i in 1:10){
+  sub <- train_sub_open %>% filter(Store == i)
+  sales <- sub$Sales
+  val[val$Store == i,]$prediction <- arima_model(sales, i)
+}
+
+RMSPE(val[val$Store <= 10,]$prediction, val[val$Store <= 10,]$Sales)
+
+# bind to new data frame
+# split for each store
+```
+
+
+Arima for mean of stores
+
+```{r}
+# Create time series for mean of stores
+sales_mean <- train_sub %>% group_by(Date) %>% summarise(mean(Sales))
+sales_mean_val <- val %>% group_by(Date) %>% summarise(mean(Sales))
+
+model <- auto.arima(ts(sales_mean[2], frequency = 365), D=1, lambda=BoxCox.lambda(ts(sales_mean[2], frequency = 365)))
+fcast <- forecast(model, h=dim(sales_mean_val)[1]+1, lambda=model$lambda)
+sales_mean_val$fcast <- fcast$mean[-1]
+
+print(RMSPE(ts(sales_mean_val[2]), ts(sales_mean_val[3])))
+
+#Calculate RMSPE only for data points where sales > 0, as these values will be ignored in scoring
+
+autoplot(ts(sales_mean_val[2])) + autolayer(ts(sales_mean_val[3]))
+```
+
+```{r}
+sales_mean_open <- train_sub_open %>% group_by(Date) %>% summarise(mean(Sales))
+sales_mean_open_val <- val_open %>% group_by(Date) %>% summarise(mean(Sales))
+
+model <- auto.arima(ts(sales_mean_open[2], frequency = 365), D=1, lambda=BoxCox.lambda(ts(sales_mean_open[2], frequency=365)))
+
+fcast <- forecast(model, h=dim(sales_mean_open_val)[1]+1, lambda=model$lambda)
+sales_mean_open_val$fcast <- fcast$mean[-1]
+
+print(RMSPE(ts(sales_mean_open_val[2]), ts(sales_mean_open_val[3])))
+
+
+#Seems promising, as error at 0.077, but calculation for each store id would take too much time
+
+#Calculate RMSPE only for data points where sales > 0, as these values will be ignored in scoring
+
+autoplot(ts(sales_mean_open_val[2])) + autolayer(ts(sales_mean_open_val[3]))
+```
+
+
+
+ARIMA on the average of stores with sales > 0 has RMSPE of ~0.27. Removing data points with sales = 0 in training and validation, improves the model to 0.077 RMSPE. As pre the rules of the challange, days with 0 sales will be ignored during scoring. The final model should be ARIMA for each store id, but is not feasible due to the long time to run an ARIMA for all 1115 stores.
+
+
+```{r}
+# Evaluate ARIMA trained on train_sub and train_sub_open on val and val_open 
+
+
+# Run ARIMA for store ID 1:10 to see how they perform
+```
